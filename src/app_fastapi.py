@@ -1,19 +1,20 @@
-# src/app_fastapi.py
 # -*- coding: utf-8 -*-
-from .semantic_normalize import normalize_csv_semantic  
-from .intent_gate import semantic_gate
+import os, glob
+from datetime import datetime
+from typing import List, Optional, Set, Dict
+
+from dotenv import load_dotenv
+# ✅ .env를 임포트 직후 바로 로드(환경변수 즉시 반영)
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Set, Dict
-from dotenv import load_dotenv
-import os, glob
-from datetime import datetime
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 새로 분리된 모듈들
-# ──────────────────────────────────────────────────────────────────────────────
+from .intent_gate import semantic_gate
+
+# 분리 모듈
 from .csv_io import read_qa_csv
 from .gates import gate_csv_qa
 from .preprocess import (
@@ -21,9 +22,13 @@ from .preprocess import (
     normalize_agri_input, summarize_memo,
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
+# 의미 정규화기 (있으면 사용)
+try:
+    from .semantic_normalize import normalize_csv_semantic
+except Exception:
+    normalize_csv_semantic = None
+
 # bootstrap
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     from .bootstrap import ensure_requirements_installed
 except Exception:
@@ -34,9 +39,7 @@ except Exception:
                                           lock_path: str = ".requirements.sha256"):
             return False, "bootstrap module missing"
 
-# ──────────────────────────────────────────────────────────────────────────────
 # 내부 모듈 (RAG / 파이프라인 / 규칙 분석)
-# ──────────────────────────────────────────────────────────────────────────────
 try:
     from .pipeline_langchain import FarmLogPipeline, FarmLog
 except Exception as e:
@@ -64,7 +67,6 @@ KB_DIR     = os.getenv("KB_DIR", os.path.join(PROJ_ROOT, "kb"))
 CHROMA_DIR = os.getenv("CHROMA_DIR", os.path.join(PROJ_ROOT, "chroma"))
 KEYWORDS_PATH = os.getenv("KEYWORDS_PATH", os.path.join(KB_DIR, "farming_keywords.txt"))
 
-
 _raw_csv_dir = os.getenv("STT_CSV_DIR", os.path.join(PROJ_ROOT, "stt_csv"))
 STT_CSV_DIR = os.path.abspath(_raw_csv_dir if os.path.isabs(_raw_csv_dir) else os.path.join(PROJ_ROOT, _raw_csv_dir))
 STT_CSV_FILENAME = os.getenv("STT_CSV_FILENAME", "qa.csv")
@@ -82,8 +84,11 @@ _DEFAULT_FARM_KEYWORDS: Set[str] = {
     "알솎기","봉지씌우기","착색","보르도액","낙과","일소","열과","하우스관리","예찰","약제","살포"
 }
 
+def _use_sem_norm() -> bool:
+    # ✅ 매 호출 시 환경변수 재반영
+    return (os.getenv("USE_SEMANTIC_NORMALIZER", "1").strip().lower() in ("1","true","yes")) and (normalize_csv_semantic is not None)
+
 CSV_GATE_LENIENT = os.getenv("CSV_GATE_LENIENT", "1").lower() in ("1","true","yes")
-USE_SEMANTIC_NORMALIZER = os.getenv("USE_SEMANTIC_NORMALIZER", "1").lower() in ("1","true","yes")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI
@@ -218,7 +223,7 @@ def _load_farm_keywords(path: str) -> Set[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 def _startup():
-    load_dotenv()
+    # .env는 모듈 임포트 시 이미 로드됨
     os.makedirs(STT_CSV_DIR, exist_ok=True)
 
     installed, msg = ensure_requirements_installed(requirements_path=REQ_PATH, lock_path=REQ_LOCK)
@@ -253,6 +258,7 @@ def healthz():
         "stt_csv_dir": STT_CSV_DIR,
         "stt_csv_filename": STT_CSV_FILENAME,
         "csv_gate_lenient": CSV_GATE_LENIENT,
+        "use_semantic_normalizer": _use_sem_norm(),  # ✅ 이제 true로 보일 것
     }
 
 @app.get("/texts")
@@ -399,7 +405,7 @@ def summarise_auto(req: SummariseAutoRequest):
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CSV 기반 요약 (정확 6필드, 전처리/게이트 분리 적용)
+# CSV 기반 요약
 # ──────────────────────────────────────────────────────────────────────────────
 def _id_to_csv_path(id_text: str) -> str:
     base = os.path.basename((id_text or "").strip())
@@ -420,31 +426,27 @@ def _normalize_qa(qa: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
     }
 
 def _qa_to_summary(qa: Dict[str, Optional[str]]) -> CsvSummary:
-    # 1) 의미 기반 정규화(LLM) 우선
-    if USE_SEMANTIC_NORMALIZER:
-        try:
-            norm = normalize_csv_semantic(qa)  # site/crop/operation/pesticide/fertiliser/memo
-            return CsvSummary(
-                site=norm.get("site"),
-                crop=norm.get("crop"),
-                operation=norm.get("operation"),
-                pesticide=norm.get("pesticide"),
-                fertiliser=norm.get("fertiliser"),
-                memo=norm.get("memo"),
-            )
-        except Exception:
-            # LLM 실패 시 폴백
-            pass
+    # 1차: 규칙 기반 정규화
+    norm = _normalize_qa(qa)
 
-    # 2) 폴백: 기존 규칙 정규화
-    norm2 = _normalize_qa(qa)
+    # 2차: 의미 기반 정규화(가능 시)
+    if _use_sem_norm():
+        try:
+            sem = normalize_csv_semantic(norm)
+            for k in ("site","crop","operation","pesticide","fertiliser","memo"):
+                v = sem.get(k) if isinstance(sem, dict) else None
+                if v is not None:
+                    norm[k] = v
+        except Exception:
+            pass  # 실패해도 규칙 결과 사용
+
     return CsvSummary(
-        site=norm2.get("site"),
-        crop=norm2.get("crop"),
-        operation=norm2.get("operation"),
-        pesticide=norm2.get("pesticide"),
-        fertiliser=norm2.get("fertiliser"),
-        memo=norm2.get("memo"),
+        site=norm.get("site"),
+        crop=norm.get("crop"),
+        operation=norm.get("operation"),
+        pesticide=norm.get("pesticide"),
+        fertiliser=norm.get("fertiliser"),
+        memo=norm.get("memo"),
     )
 
 @app.post("/summarise_csv_id", response_model=CsvSummary, response_model_by_alias=True)
@@ -463,7 +465,6 @@ def summarise_csv_json(req: CsvJsonReq):
     if req.id:
         csv_path = _id_to_csv_path(req.id)
     elif req.path:
-        # 상대경로가 들어오면 프로젝트 루트 기준 절대화
         csv_path = req.path if os.path.isabs(req.path) else os.path.abspath(os.path.join(PROJ_ROOT, req.path))
     else:
         raise HTTPException(status_code=400, detail="must provide id or path")
